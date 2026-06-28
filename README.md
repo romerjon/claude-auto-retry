@@ -76,7 +76,7 @@ When you disconnect (SSH drops, close terminal, laptop sleeps), **tmux keeps run
 - **Timezone-aware** — parses reset times with full IANA timezone support (including half-hour offsets)
 - **DST-safe** — iterative offset correction handles daylight saving transitions
 - **Safe send-keys** — verifies Claude is still the foreground process before injecting text
-- **Overload backoff** — detects sustained API 529/500/503 and retries on a configurable exponential backoff with jitter and a cumulative-wait cap, distinct from the usage-reset path ([details](#overload-backoff-529--500--503))
+- **Overload backoff** — detects sustained API overload (`429/500/502/503/504/529`) and retries on a configurable exponential backoff with jitter and a cumulative-wait cap, distinct from the usage-reset path ([details](#overload-backoff))
 - **`--print` mode support** — buffers output, retries cleanly for piped/scripted usage
 - **Configurable** — retry count, wait margin, custom patterns, retry message
 - **Config validation** — bad config values fall back to safe defaults instead of crashing
@@ -123,19 +123,34 @@ Optional. Create `~/.claude-auto-retry.json`:
 
 All fields optional. Invalid values fall back to defaults automatically.
 
-## Overload backoff (529 / 500 / 503)
+## Overload backoff
 
 Separate from subscription rate limits, this fork also detects **sustained API
-overload** — `API Error: 529 Overloaded`, `API Error: 500 / 500 Internal server
-error`, and `503` — and retries on an **exponential backoff** instead of waiting
-for a usage reset. The two paths never collide; usage limits always take
-precedence.
+overload** — Claude Code's own terminal `API Error: <code>` line for the retryable
+set (`429 / 500 / 502 / 503 / 504 / 529`, or an `overloaded_error` JSON body) — and
+retries on an **exponential backoff** instead of waiting for a usage reset. The two
+paths never collide; usage limits always take precedence.
 
 > **Sustained only.** Claude Code already retries transient 5xx/529 internally
 > with its own backoff. This feature fires only when those internal retries are
 > exhausted and a *terminal* error is left in the pane. It should rarely trigger.
-> `500` is a default pattern because, unlike 529/503, a `500 Internal server
-> error` has been observed to halt a session without self-resuming.
+
+> **Terminal vs. transient.** Claude Code renders an in-progress retry as the
+> *parens* form `API Error (529 …) · Retrying in 5s · attempt 3/10`, and the final
+> exhausted error as the *colon* form `API Error: 529 …`. Detection requires the
+> colon form **and** suppresses the `· Retrying…` / `attempt n/m` suffix, so the tool
+> never interrupts Claude's own backoff.
+
+> **Anchored, tail-only matching (why it won't fire on your code).** Patterns are
+> case-insensitive **regexes** matched against only the **last 12 lines** of the
+> pane — never the full scrollback. They are anchored to Claude Code's `API Error:
+> <code>` render, so a bare `503` in code you're editing (`res.status(503)`), a
+> port number, a quoted log, or a `status.claude.com` link in a comment will **not**
+> trip detection. The one residual: a live tail that literally contains
+> `API Error: 529` (e.g. editing this tool, or docs about Claude errors) will match —
+> set `"enabled": false` while doing that. (Earlier versions matched bare status
+> numbers across the whole capture, which injected spurious retries during ordinary
+> web-dev sessions.) For a structured, ambiguity-free trigger see `DESIGN-NOTES.md`.
 
 Configured under an `overload` block (shown with its defaults):
 
@@ -143,7 +158,7 @@ Configured under an `overload` block (shown with its defaults):
 {
   "overload": {
     "enabled": true,
-    "patterns": ["Overloaded", "API Error: 529", "529", "API Error: 500", "500 Internal server error", "Internal server error", "503", "status.claude.com"],
+    "patterns": ["API Error:\\s*(429|500|502|503|504|529)\\b", "overloaded_error", "temporarily limiting requests"],
     "backoffSeconds": [30, 60, 120, 240, 300],
     "steadyStateSeconds": 300,
     "jitterPct": 15,
@@ -158,7 +173,7 @@ Configured under an `overload` block (shown with its defaults):
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled` | `true` | Turn the overload path on/off |
-| `patterns` | (see above) | Case-insensitive substrings that mark a terminal overload error |
+| `patterns` | (see above) | Case-insensitive **regexes** matching a terminal overload error in the pane tail (last 12 lines) |
 | `backoffSeconds` | `[30,60,120,240,300]` | Wait before each retry; index `i` for attempt `i` |
 | `steadyStateSeconds` | `300` | Wait once the `backoffSeconds` array is exhausted |
 | `jitterPct` | `15` | ±% jitter applied to every wait (clamped 0–100) |

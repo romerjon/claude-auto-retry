@@ -1,4 +1,4 @@
-import { stripAnsi, isRateLimited, findRateLimitMessage, detectOverload, isWorking } from './patterns.js';
+import { stripAnsi, isRateLimited, findRateLimitMessage, detectOverload, overloadMatch, isWorking } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
 import { capturePane, sendKeys, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
@@ -193,10 +193,12 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     return enterUsageWait(state, stripped, config);
   }
 
-  if (overload && overload.enabled
-      && detectOverload(stripped, overload.patterns)
-      && !isWorking(stripped)) {
-    return enterOverload(state, overload, rand);
+  if (overload && overload.enabled && !isWorking(stripped)) {
+    const match = overloadMatch(stripped, overload.patterns);
+    if (match) {
+      state._overloadMatch = match;  // surfaced in the 'overload-detected' log line
+      return enterOverload(state, overload, rand);
+    }
   }
 
   return 'monitoring';
@@ -231,7 +233,9 @@ export async function startMonitor(pane, pid) {
       if (result === 'skipped-not-claude') await logger.warn(`Foreground is "${state._lastForeground}", not Claude. Skipping send-keys. (Add to foregroundCommands in ~/.claude-auto-retry.json if this is wrong)`);
       if (result === 'overload-detected') {
         const secs = Math.round((state.overloadWaitUntil - Date.now()) / 1000);
-        await logger.warn(`Overload/transient API error detected (sustained). Backing off ${secs}s before retry. NOTE: Claude Code retries 5xx/529 internally — this only fires on terminal overload.`);
+        const m = state._overloadMatch;
+        const why = m ? ` [matched /${m.pattern}/ in: "${m.line}"]` : '';
+        await logger.warn(`Overload/transient API error detected (sustained)${why}. Backing off ${secs}s before retry. NOTE: Claude Code retries 5xx/529 internally — this only fires on terminal overload.`);
       }
       if (result === 'overload-retried') {
         const secs = Math.round((state.overloadWaitUntil - Date.now()) / 1000);
