@@ -7,10 +7,25 @@ import { homedir } from 'node:os';
 // *seconds* on an exponential backoff. See README "Overload backoff".
 export const DEFAULT_OVERLOAD = {
   enabled: true,
+  // Anchored to Claude Code's actual TERMINAL error render — NOT bare status numbers.
+  // A bare "503"/"529" matches ordinary code (res.status(503)), ports, byte counts and
+  // quoted logs, which is what caused false "Continue where you left off." injections.
+  // Matched as case-insensitive regexes against only the pane tail (see detectOverload).
+  //
+  // Claude Code (verified against the v2.1.x binary) has TWO render forms:
+  //   terminal (retries exhausted):  "API Error: 529 {…}"  / "API Error: 503 no healthy upstream"
+  //   transient (still retrying):     "API Error (529 …) · Retrying in 5s · attempt 3/10"
+  // We REQUIRE the colon form to skip the parens form, and the retry SUFFIX
+  // ("· Retrying in…" / "attempt n/m") is separately suppressed by the working gate
+  // in patterns.js — together they ensure we never interrupt Claude's own backoff.
   patterns: [
-    'Overloaded', 'API Error: 529', '529',
-    'API Error: 500', '500 Internal server error', 'Internal server error',
-    '503', 'status.claude.com',
+    // Terminal error line. Covers the full retryable set (429+5xx) in the colon form.
+    'API Error:\\s*(429|500|502|503|504|529)\\b',
+    // JSON error.type for a sustained overload (survives the collapsed non-JSON render).
+    'overloaded_error',
+    // API-level 429 uses a dedicated render with no 3-digit code in the generic slot:
+    //   "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+    'temporarily limiting requests',
   ],
   backoffSeconds: [30, 60, 120, 240, 300],
   steadyStateSeconds: 300,
@@ -54,8 +69,13 @@ function validateOverload(raw) {
 
   o.enabled = typeof o.enabled === 'boolean' ? o.enabled : DEFAULT_OVERLOAD.enabled;
 
+  // Patterns are case-insensitive regexes (see detectOverload). Keep only non-empty
+  // strings that actually compile, so a typo'd pattern can't crash the monitor tick.
   const pats = Array.isArray(o.patterns)
-    ? o.patterns.filter(p => typeof p === 'string' && p.length > 0)
+    ? o.patterns.filter(p => {
+        if (typeof p !== 'string' || p.length === 0) return false;
+        try { new RegExp(p); return true; } catch { return false; }
+      })
     : [];
   o.patterns = pats.length > 0 ? pats : [...DEFAULT_OVERLOAD.patterns];
 

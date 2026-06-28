@@ -72,27 +72,78 @@ export function isRateLimited(text, customPatterns = []) {
 
 // --- Overload / transient API error detection (distinct from usage limits) ---
 // Claude Code already retries 5xx/529 internally; this only fires on a *sustained*
-// terminal error left in the pane. Patterns are plain substrings (case-insensitive),
-// config-driven via the `overload.patterns` block. Kept entirely separate from the
-// usage-limit path above so the two never collide.
+// terminal error left in the pane. Patterns are case-insensitive regexes (same as
+// the usage-limit customPatterns), config-driven via `overload.patterns`. Kept
+// entirely separate from the usage-limit path above so the two never collide.
+//
+// Two guards keep this from firing on ordinary content (the historical bug: a bare
+// "503"/"529" in code under edit, an HTTP status in a quoted log, or "status.claude.com"
+// in a comment all looked identical to a live error):
+//   1. Patterns are ANCHORED to Claude Code's actual error render ("API Error: <code>"
+//      or the "overloaded_error" JSON type) — never a bare status number.
+//   2. Only the TAIL of the pane is inspected. A *terminal* error is the last thing
+//      Claude printed; the same digits sitting in scrollback the user scrolled past
+//      are not an error. Matching the full 20-line capture is what drove the false
+//      positives — a 503 far up the buffer kept re-triggering during unrelated work.
 
-// Active-work indicators in the Claude Code TUI footer. While any of these is on
-// screen, Claude is mid-flight (its own internal retry may be running), so an
-// overload line in the scrollback is NOT terminal — we must not drive the session.
+// A real terminal error sits just above the input box (~5-6 variable lines: box
+// borders + input row(s) + footer). A multi-line JSON error body adds a few more, so
+// its anchor line can land ~10 rows from the bottom. 12 covers that with margin while
+// still trimming the top ~8 lines of the 20-line capture (where stale scrollback lives).
+const OVERLOAD_TAIL_LINES = 12;
+
+// Indicators that Claude is mid-flight and the pane is NOT in a terminal error state.
+// Two kinds: the streaming footer, and Claude Code's OWN internal-retry indicator.
+// While either is on screen the request's retries are not exhausted — acting now would
+// interrupt Claude's backoff. The transient error render is "API Error (529 …) ·
+// Retrying in 5s · attempt 3/10"; the colon form can also carry the "· Retrying" suffix
+// until exhausted, so we gate on the suffix itself, not just the parens form.
 const WORKING_PATTERNS = [
   /esc to interrupt/i,        // the working/streaming footer ("… (esc to interrupt)")
   /\besc\b.*\binterrupt\b/i,  // tolerate reordering/spacing in the same footer
+  /Retrying in\b/i,           // internal-retry suffix — retries not yet exhausted
+  /\battempt\s+\d+\/\d+/i,    // "attempt 3/10" companion to the retry suffix
 ];
 
+function tail(text) {
+  return stripAnsi(text).split('\n').slice(-OVERLOAD_TAIL_LINES);
+}
+
+// Compile a config pattern (string → case-insensitive RegExp) once per call. Invalid
+// regexes are dropped rather than thrown (matches the usage-limit customPatterns path).
+function toRegexes(patterns) {
+  const out = [];
+  for (const p of patterns) {
+    if (p instanceof RegExp) { out.push(p); continue; }
+    if (typeof p !== 'string' || !p) continue;
+    try { out.push(new RegExp(p, 'i')); } catch { /* skip invalid */ }
+  }
+  return out;
+}
+
+// Returns { pattern, line } for the first overload pattern matching a tail line, else
+// null. Per-line (not whole-tail) so we can report WHICH line tripped it — invaluable
+// for diagnosing a future false positive (the original bug logged no reason at all).
+export function overloadMatch(text, patterns = []) {
+  if (!patterns || patterns.length === 0) return null;
+  const lines = tail(text);
+  if (!lines.join('').trim()) return null;
+  const regexes = toRegexes(patterns);
+  for (const line of lines) {
+    for (const r of regexes) {
+      if (r.test(line)) return { pattern: r.source, line: line.trim().slice(0, 200) };
+    }
+  }
+  return null;
+}
+
 export function detectOverload(text, patterns = []) {
-  if (!patterns || patterns.length === 0) return false;
-  const haystack = stripAnsi(text).toLowerCase();
-  return patterns.some(p => typeof p === 'string' && p && haystack.includes(p.toLowerCase()));
+  return overloadMatch(text, patterns) !== null;
 }
 
 export function isWorking(text) {
-  const stripped = stripAnsi(text);
-  return WORKING_PATTERNS.some(p => p.test(stripped));
+  const lines = tail(text);
+  return lines.some(line => WORKING_PATTERNS.some(p => p.test(line)));
 }
 
 export function findRateLimitMessage(text, customPatterns = []) {

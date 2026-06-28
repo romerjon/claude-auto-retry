@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectOverload, isWorking } from '../src/patterns.js';
+import { detectOverload, overloadMatch, isWorking } from '../src/patterns.js';
 import { loadConfig, DEFAULT_CONFIG, DEFAULT_OVERLOAD } from '../src/config.js';
 import {
   createMonitorState, processOneTick,
@@ -28,24 +28,64 @@ function cfg(overrides = {}) {
 const NO_JITTER = () => 0.5; // factor = 1 + (0.5*2-1)*pct = 1 (no shift)
 
 describe('detectOverload', () => {
-  it('matches "Overloaded"', () => assert.equal(detectOverload('⚠ Overloaded', PATS), true));
   it('matches "API Error: 529"', () => assert.equal(detectOverload('API Error: 529 Overloaded', PATS), true));
-  it('matches bare 529', () => assert.equal(detectOverload('got a 529 back', PATS), true));
-  it('matches "500 Internal server error"', () => assert.equal(detectOverload('500 Internal server error · try again', PATS), true));
-  it('matches "API Error: 500"', () => assert.equal(detectOverload('API Error: 500 {"type":"error"}', PATS), true));
-  it('matches 503', () => assert.equal(detectOverload('503 Service Unavailable', PATS), true));
-  it('matches status.claude.com hint', () => assert.equal(detectOverload('see status.claude.com', PATS), true));
+  it('matches "API Error: 500 Internal server error"', () => assert.equal(detectOverload('API Error: 500 Internal server error', PATS), true));
+  it('matches "API Error: 503 no healthy upstream" (plain-text edge body)', () => assert.equal(detectOverload('API Error: 503 no healthy upstream', PATS), true));
+  it('matches "API Error: 502"', () => assert.equal(detectOverload('API Error: 502 Bad Gateway', PATS), true));
+  it('matches "API Error: 504"', () => assert.equal(detectOverload('API Error: 504 Gateway Timeout', PATS), true));
+  it('matches the overloaded_error JSON type', () => assert.equal(detectOverload('API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}', PATS), true));
+  it('matches the dedicated API-429 render (no 3-digit code in the slot)', () => assert.equal(detectOverload('API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited', PATS), true));
+  it('tolerates missing space after the colon', () => assert.equal(detectOverload('API Error:529', PATS), true));
   it('is case-insensitive', () => assert.equal(detectOverload('api error: 529 OVERLOADED', PATS), true));
   it('detects through ANSI codes', () => assert.equal(detectOverload('\x1b[31mAPI Error: 529\x1b[0m \x1b[1mOverloaded\x1b[0m', PATS), true));
   it('returns false for normal output', () => assert.equal(detectOverload('Here is the code you asked for', PATS), false));
   it('returns false for empty patterns', () => assert.equal(detectOverload('API Error: 529', []), false));
   it('returns false for empty text', () => assert.equal(detectOverload('', PATS), false));
+
+  // --- Regression: the exact false positives that injected "Continue where you left
+  //     off." into live sessions. None of these are a terminal API error. ---
+  it('does NOT match a bare status number ("got a 529 back")', () => assert.equal(detectOverload('got a 529 back', PATS), false));
+  it('does NOT match Express code under edit (res.status(503))', () => assert.equal(detectOverload('      res.status(503).json({ status: "degraded", db: "down" });', PATS), false));
+  it('does NOT match a Dockerfile HEALTHCHECK with 503/500 in a comment', () => assert.equal(detectOverload('# 500 Internal server error / 503 ... liveness check (200 even if DB down)', PATS), false));
+  it('does NOT match a "status.claude.com" mention in prose/comments', () => assert.equal(detectOverload('see status.claude.com for incidents', PATS), false));
+  it('does NOT match a bare "500 Internal server error" without the API Error frame', () => assert.equal(detectOverload('500 Internal server error · try again', PATS), false));
+
+  // --- Terminal vs transient: the parens form means Claude is STILL retrying. Acting
+  //     on it would interrupt Claude's own backoff. Only the colon form is terminal. ---
+  it('does NOT match the transient parens retry form', () => assert.equal(detectOverload('API Error (529 {"type":"error"}) · Retrying in 5s · attempt 3/10', PATS), false));
+
+  // --- Tail-anchoring: an error that has scrolled up out of the live tail is no
+  //     longer terminal. This is the n8n case (clean tail, status code in scrollback). ---
+  it('does NOT match an API error buried above the 12-line tail', () => {
+    const pane = ['API Error: 529 Overloaded', ...Array(15).fill('● Deleted workflow TEMP_fx_verify'), 'done.'].join('\n');
+    assert.equal(detectOverload(pane, PATS), false);
+  });
+  it('matches an API error sitting in the live tail', () => {
+    const pane = ['some earlier output', 'more output', 'API Error: 529 Overloaded'].join('\n');
+    assert.equal(detectOverload(pane, PATS), true);
+  });
+});
+
+describe('overloadMatch (observability)', () => {
+  it('reports the matched pattern and offending line', () => {
+    const m = overloadMatch('thinking…\nAPI Error: 529 Overloaded', PATS);
+    assert.ok(m && /429\|500/.test(m.pattern));
+    assert.equal(m.line, 'API Error: 529 Overloaded');
+  });
+  it('returns null when nothing matches', () => assert.equal(overloadMatch('res.status(503)', PATS), null));
+  it('truncates a very long offending line to 200 chars', () => {
+    const m = overloadMatch('API Error: 500 ' + 'x'.repeat(500), PATS);
+    assert.ok(m && m.line.length <= 200);
+  });
 });
 
 describe('isWorking', () => {
   it('detects the working footer', () => assert.equal(isWorking('Cogitating… (esc to interrupt)'), true));
   it('detects esc/interrupt through ANSI', () => assert.equal(isWorking('\x1b[2mesc to interrupt\x1b[0m'), true));
   it('returns false at an idle prompt', () => assert.equal(isWorking('│ > '), false));
+  // Claude's internal-retry indicator means retries are NOT exhausted → not terminal.
+  it('treats the "Retrying in" suffix as still-working', () => assert.equal(isWorking('API Error: 529 Overloaded · Retrying in 5s · attempt 3/10'), true));
+  it('treats an "attempt n/m" indicator as still-working', () => assert.equal(isWorking('thinking… attempt 2/10'), true));
 });
 
 describe('DEFAULT_OVERLOAD config', () => {
@@ -56,7 +96,9 @@ describe('DEFAULT_OVERLOAD config', () => {
     assert.equal(DEFAULT_CONFIG.overload.jitterPct, 15);
     assert.equal(DEFAULT_CONFIG.overload.maxTotalWaitMinutes, 120);
     assert.equal(DEFAULT_CONFIG.overload.relaunchOnExit, false);
-    assert.ok(DEFAULT_CONFIG.overload.patterns.includes('Overloaded'));
+    assert.ok(DEFAULT_CONFIG.overload.patterns.includes('overloaded_error'));
+    // Defaults must never carry a bare status number — that's the false-positive class.
+    assert.ok(!DEFAULT_CONFIG.overload.patterns.some(p => /^\d+$/.test(p)));
   });
 });
 
@@ -142,6 +184,14 @@ describe('processOneTick — overload path', () => {
     const s = createMonitorState();
     assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'monitoring');
     assert.equal(s.status, 'monitoring');
+  });
+
+  it('does NOT enter overload while Claude is still internally retrying (colon form + suffix)', async () => {
+    const t = mockTmux('API Error: 529 {"type":"error"} · Retrying in 5s · attempt 3/10');
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'monitoring');
+    assert.equal(s.status, 'monitoring');
+    assert.equal(t._sent.length, 0);
   });
 
   it('does NOT retry a non-target error', async () => {
