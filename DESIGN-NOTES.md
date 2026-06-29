@@ -37,7 +37,28 @@ move is to stop using the scrape as the *trigger*.
   Claude streams, so a mid-response overload may render differently than a pre-flight
   failure. Not currently special-cased; low observed frequency.
 
-## 1. Replace the trigger with `StopFailure` (highest leverage)
+## 1. Replace the trigger with `StopFailure` (highest leverage) — **[done, v0.4.0]**
+
+**Implemented.** The launcher stamps `CLAUDE_AUTO_RETRY_PANE` onto claude's env; the
+`StopFailure` hook (`claude-auto-retry _stopfailure-hook`, installed via
+`install-hook`) runs as a claude child, inherits that var, and writes a pane-keyed
+marker under `~/.claude-auto-retry/events/` for retryable error types
+(`overloaded|server_error|rate_limit`). The monitor reads the marker for its own pane
+each tick; the first marker latches `eventMode`, which disables the scraper for that
+session. Edge-triggered: one backoff-then-send per failure, then back to monitoring;
+self-recovery and foreground/shell gates still apply; the cumulative cap is shared with
+the scraper path. The scraper remains the fallback until a marker is ever seen (hook
+absent, pre-`v0.4.0` session without the pane env, or non-tmux).
+
+**Correlation correction (learned during build):** the original plan resolved the
+session via `/proc/<pid>/environ` → `CLAUDE_CODE_SESSION_ID`. In practice the *main*
+claude PID's environ carries `CLAUDE_CONFIG_DIR` but **not** the session id (that var is
+injected only into claude's child processes). Pane-keying via the launcher-stamped env
+sidesteps this entirely and needs no `/proc` access (so it also works off-Linux).
+Residual caveat: a recycled tmux pane id could in principle replay a stale marker —
+bounded by `eventMaxAgeSeconds` (default 120) and consume-on-read.
+
+### Original design (retained for reference)
 
 Claude Code has a **`StopFailure` hook** that fires *only* when a turn ends due to an
 API error, with a typed `error_type` matcher (`overloaded`, `server_error`,

@@ -187,6 +187,25 @@ error clears (success) or the cumulative wait reaches `maxTotalWaitMinutes` (giv
 up — the cap guards against hammering a genuinely-down endpoint or masking a real
 outage; check [status.claude.com](https://status.claude.com)).
 
+### Event-driven detection (recommended — no scraping)
+
+The scraper above is a heuristic over terminal output. For an exact, ambiguity-free
+trigger, install the **`StopFailure` hook** — Claude Code fires it precisely when a
+turn ends in an API error, with a typed error class:
+
+```sh
+claude-auto-retry install-hook            # into $CLAUDE_CONFIG_DIR or ~/.claude
+claude-auto-retry install-hook ~/.claude-business   # repeat per config dir you use
+```
+
+This adds a `StopFailure` hook (matcher `overloaded|server_error|rate_limit`) that
+writes a pane-keyed marker the monitor consumes — no terminal scraping, so it cannot
+false-positive on code or scrollback. Sessions launched via the wrapper **after**
+installing the hook use it automatically; the first marker latches event mode and
+disables the scraper for that session. Sessions without the hook (or pre-install) fall
+back to the anchored scraper. Remove with `uninstall-hook`. See `DESIGN-NOTES.md` for
+the architecture.
+
 ### Gating decision (alive-at-prompt vs exited-to-shell)
 
 A transient API error in interactive Claude Code surfaces inline and leaves the

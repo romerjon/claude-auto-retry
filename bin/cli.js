@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { writeStopFailureEvent, isRetryableError } from '../src/events.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -195,6 +196,68 @@ async function cmdLogs() {
   });
 }
 
+// --- StopFailure hook (event-driven overload trigger) ---
+
+const HOOK_MARKER = '_stopfailure-hook';
+
+function stopFailureHookEntry() {
+  // Matcher filters on the StopFailure error type; we want the retryable classes only.
+  return {
+    matcher: 'overloaded|server_error|rate_limit',
+    hooks: [{ type: 'command', command: `node ${__filename} ${HOOK_MARKER}`, timeout: 5 }],
+  };
+}
+
+function resolveConfigDir(arg) {
+  return arg || process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+}
+
+// Invoked BY Claude Code on a turn-ending API error. Reads the hook JSON on stdin and,
+// for a retryable error, writes a pane-keyed marker the monitor consumes. Must never
+// disrupt the session: StopFailure output/exit is ignored, and we swallow all errors.
+async function cmdStopFailureHook() {
+  try {
+    const chunks = [];
+    for await (const c of process.stdin) chunks.push(c);
+    const payload = JSON.parse(Buffer.concat(chunks).toString() || '{}');
+    const pane = process.env.CLAUDE_AUTO_RETRY_PANE;
+    if (pane && isRetryableError(payload.error)) {
+      await writeStopFailureEvent(pane, payload);
+    }
+  } catch { /* swallow — never break the host session */ }
+  process.exit(0);
+}
+
+async function cmdInstallHook() {
+  const settingsPath = join(resolveConfigDir(process.argv[3]), 'settings.json');
+  let settings = {};
+  try { settings = JSON.parse(await readFile(settingsPath, 'utf-8')); } catch { /* new file */ }
+  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
+  const existing = Array.isArray(settings.hooks.StopFailure) ? settings.hooks.StopFailure : [];
+  // Idempotent: drop any prior entry pointing at our handler, then add the current one.
+  const kept = existing.filter((e) => !JSON.stringify(e).includes(HOOK_MARKER));
+  kept.push(stopFailureHookEntry());
+  settings.hooks.StopFailure = kept;
+  await mkdir(dirname(settingsPath), { recursive: true });
+  await writeFile(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  console.log(`StopFailure hook installed in ${settingsPath}`);
+  console.log('New Claude sessions launched via the wrapper will use event-driven detection.');
+}
+
+async function cmdUninstallHook() {
+  const settingsPath = join(resolveConfigDir(process.argv[3]), 'settings.json');
+  try {
+    const settings = JSON.parse(await readFile(settingsPath, 'utf-8'));
+    if (Array.isArray(settings.hooks?.StopFailure)) {
+      settings.hooks.StopFailure = settings.hooks.StopFailure.filter((e) => !JSON.stringify(e).includes(HOOK_MARKER));
+      if (settings.hooks.StopFailure.length === 0) delete settings.hooks.StopFailure;
+      if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
+      await writeFile(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    }
+    console.log(`StopFailure hook removed from ${settingsPath}`);
+  } catch { console.log('No settings file to modify.'); }
+}
+
 async function cmdVersion() {
   try {
     const pkg = JSON.parse(await readFile(join(__dirname, '..', 'package.json'), 'utf-8'));
@@ -210,16 +273,23 @@ const command = process.argv[2];
 switch (command) {
   case 'install': await cmdInstall(); break;
   case 'uninstall': await cmdUninstall(); break;
+  case 'install-hook': await cmdInstallHook(); break;
+  case 'uninstall-hook': await cmdUninstallHook(); break;
+  case HOOK_MARKER: await cmdStopFailureHook(); break;
   case 'status': await cmdStatus(); break;
   case 'logs': await cmdLogs(); break;
   case 'version': case '--version': case '-v': await cmdVersion(); break;
   default:
     console.log('claude-auto-retry - Auto-retry Claude Code on subscription rate limits\n');
     console.log('Usage:');
-    console.log('  claude-auto-retry install     Install shell wrapper + tmux');
-    console.log('  claude-auto-retry uninstall   Remove shell wrapper');
-    console.log('  claude-auto-retry status      Show monitor status');
-    console.log('  claude-auto-retry logs        Tail today\'s log');
-    console.log('  claude-auto-retry version     Print version');
+    console.log('  claude-auto-retry install            Install shell wrapper + tmux');
+    console.log('  claude-auto-retry uninstall          Remove shell wrapper');
+    console.log('  claude-auto-retry install-hook [dir] Install the StopFailure hook (event-driven');
+    console.log('                                       overload detection) into <dir>/settings.json');
+    console.log('                                       (default: $CLAUDE_CONFIG_DIR or ~/.claude)');
+    console.log('  claude-auto-retry uninstall-hook [dir]  Remove the StopFailure hook');
+    console.log('  claude-auto-retry status             Show monitor status');
+    console.log('  claude-auto-retry logs               Tail today\'s log');
+    console.log('  claude-auto-retry version            Print version');
     break;
 }

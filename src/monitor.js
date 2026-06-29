@@ -3,6 +3,7 @@ import { parseResetTime, calculateWaitMs } from './time-parser.js';
 import { capturePane, sendKeys, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
+import { readStopFailureEvent, clearStopFailureEvent } from './events.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 const SHELL_COMMANDS = ['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh'];
@@ -12,6 +13,10 @@ export function createMonitorState() {
     status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null,
     // Overload-retry sub-state, kept distinct from the usage-reset fields above.
     overloadAttempts: 0, overloadTotalWaitMs: 0, overloadWaitUntil: 0,
+    // Event-driven overload: eventMode latches true once a StopFailure marker is ever
+    // seen (proves the hook is live → stop trusting the scraper). viaEvent marks the
+    // current backoff window as event-triggered (edge: one send per failure).
+    eventMode: false, viaEvent: false,
   };
 }
 
@@ -37,6 +42,20 @@ function resetOverload(state) {
   state.overloadAttempts = 0;
   state.overloadTotalWaitMs = 0;
   state.overloadWaitUntil = 0;
+  state.viaEvent = false;
+}
+
+// Foreground safety: is claude/node the foreground process (safe to send-keys), or did
+// it exit to a shell / is some other app focused? Returns { ok, fg, isShell }.
+async function checkForeground(tmuxAdapter, pane, config) {
+  const isFg = await tmuxAdapter.isClaudeForeground();
+  if (isFg === true) return { ok: true, fg: null, isShell: false };
+  const fg = await tmuxAdapter.getPaneCommand(pane);
+  const fgCommands = config.foregroundCommands || DEFAULT_FOREGROUND_COMMANDS;
+  if (fgCommands.some(c => fg.toLowerCase().includes(c))) return { ok: true, fg, isShell: false };
+  const lc = (fg || '').toLowerCase();
+  const isShell = lc !== '' && SHELL_COMMANDS.some(s => lc === s || lc.includes(s));
+  return { ok: false, fg, isShell };
 }
 
 function enterUsageWait(state, stripped, config) {
@@ -118,6 +137,34 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     if (Date.now() < state.overloadWaitUntil) return 'overload-waiting';
     if (!isAlive()) return 'exit';
 
+    // Event-triggered window: a StopFailure marker put us here. Edge-triggered — send
+    // exactly once per failure, then return to monitoring to await the next marker. We
+    // do NOT re-check the scraper for "still overloaded" (the marker was authoritative).
+    if (state.viaEvent) {
+      // Self-recovery: Claude resumed during the backoff → don't interrupt it.
+      if (isWorking(stripped)) { resetOverload(state); state.status = 'monitoring'; return 'overload-cleared'; }
+      // A usage limit appearing mid-wait still takes precedence.
+      if (isRateLimited(stripped, config.customPatterns)) { resetOverload(state); return enterUsageWait(state, stripped, config); }
+
+      const foregroundOk = await checkForeground(tmuxAdapter, pane, config);
+      if (!foregroundOk.ok) {
+        state._lastForeground = foregroundOk.fg;
+        state.viaEvent = false; state.status = 'monitoring';
+        if (foregroundOk.isShell && overload.relaunchOnExit) {
+          state.overloadAttempts++;
+          await tmuxAdapter.sendKeys(pane, overload.relaunchCommand);
+          return 'overload-relaunched';
+        }
+        return foregroundOk.isShell ? 'overload-exited-to-shell' : 'skipped-not-claude';
+      }
+
+      state.overloadAttempts++;          // next failure backs off further
+      state.viaEvent = false;
+      state.status = 'monitoring';
+      await tmuxAdapter.sendKeys(pane, overload.retryMessage);
+      return 'overload-retried';
+    }
+
     const capMs = overload.maxTotalWaitMinutes * 60_000;
 
     // Usage-limit takes precedence: hand off to the (hours-scale) reset path.
@@ -193,7 +240,29 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     return enterUsageWait(state, stripped, config);
   }
 
-  if (overload && overload.enabled && !isWorking(stripped)) {
+  // Event-driven overload (authoritative; see DESIGN-NOTES §1). A StopFailure marker for
+  // this pane means the turn ended in a retryable API error — no scraping, no ambiguity.
+  // Latches eventMode so the scraper path is disabled once we know the hook is live.
+  if (overload && overload.enabled && tmuxAdapter.readEvent) {
+    const ev = await tmuxAdapter.readEvent();
+    if (ev) {
+      state.eventMode = true;
+      await tmuxAdapter.clearEvent();               // consume
+      if (isWorking(stripped)) { resetOverload(state); return 'overload-cleared'; } // self-recovered
+      const capMs = overload.maxTotalWaitMinutes * 60_000;
+      if (state.overloadTotalWaitMs >= capMs) return 'overload-gave-up';
+      const w = nextOverloadWaitMs(state.overloadAttempts, overload, rand);
+      state.overloadTotalWaitMs += w;
+      state.overloadWaitUntil = Date.now() + w;
+      state.status = 'overload';
+      state.viaEvent = true;
+      state._overloadMatch = { pattern: 'StopFailure', line: `error=${ev.error}` };
+      return 'overload-detected';
+    }
+  }
+
+  // Scraper fallback — only while eventMode hasn't latched (hook absent or not yet fired).
+  if (!state.eventMode && overload && overload.enabled && !isWorking(stripped)) {
     const match = overloadMatch(stripped, overload.patterns);
     if (match) {
       state._overloadMatch = match;  // surfaced in the 'overload-detected' log line
@@ -213,7 +282,15 @@ export async function startMonitor(pane, pid) {
 
   await logger.info(`Monitor started for pane ${pane} (claude PID: ${pid})`);
 
-  const tmuxAdapter = { capturePane, sendKeys, getPaneCommand, isClaudeForeground: () => isProcessForeground(pid) };
+  const eventMaxAgeMs = (config.overload?.eventMaxAgeSeconds || 120) * 1000;
+  const tmuxAdapter = {
+    capturePane, sendKeys, getPaneCommand,
+    isClaudeForeground: () => isProcessForeground(pid),
+    // Pane-keyed StopFailure markers (written by the hook). The daemon owns the pane,
+    // so this is a direct read — no session-id resolution needed.
+    readEvent: () => readStopFailureEvent(pane, eventMaxAgeMs),
+    clearEvent: () => clearStopFailureEvent(pane),
+  };
   const isAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
   const loop = async () => {

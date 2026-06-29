@@ -31,6 +31,9 @@ export const DEFAULT_OVERLOAD = {
   steadyStateSeconds: 300,
   jitterPct: 15,
   maxTotalWaitMinutes: 120,
+  // StopFailure event markers older than this are ignored (guards against a recycled
+  // tmux pane id replaying a stale failure, or acting on a marker left while down).
+  eventMaxAgeSeconds: 120,
   retryMessage: 'Continue where you left off.',
   // Gating: by default we only act when claude is alive at its prompt (the
   // foreground safety check passes). If a 500 ever drops you to the shell, the
@@ -87,6 +90,7 @@ function validateOverload(raw) {
   o.steadyStateSeconds = validNumber(o.steadyStateSeconds, 1, DEFAULT_OVERLOAD.steadyStateSeconds);
   o.jitterPct = clamp(o.jitterPct, 0, 100, DEFAULT_OVERLOAD.jitterPct);
   o.maxTotalWaitMinutes = validNumber(o.maxTotalWaitMinutes, 0.1, DEFAULT_OVERLOAD.maxTotalWaitMinutes);
+  o.eventMaxAgeSeconds = validNumber(o.eventMaxAgeSeconds, 1, DEFAULT_OVERLOAD.eventMaxAgeSeconds);
 
   if (typeof o.retryMessage !== 'string' || !o.retryMessage) {
     o.retryMessage = DEFAULT_OVERLOAD.retryMessage;
