@@ -9,13 +9,15 @@ import {
 
 const PATS = DEFAULT_OVERLOAD.patterns;
 
-function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = true) {
+function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = true, event = null) {
   const t = {
-    _sent: [],
+    _sent: [], _event: event, _cleared: false,
     capturePane: async () => paneContent,
     getPaneCommand: async () => paneCommand,
     sendKeys: async (_p, text) => { t._sent.push(text); },
     isClaudeForeground: async () => claudeForeground,
+    readEvent: async () => t._event,
+    clearEvent: async () => { t._event = null; t._cleared = true; },
   };
   return t;
 }
@@ -272,6 +274,69 @@ describe('processOneTick — overload path', () => {
     assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'waiting');
     assert.equal(s.status, 'waiting');
     assert.equal(s.overloadAttempts, 0);
+  });
+});
+
+describe('processOneTick — StopFailure event path (authoritative)', () => {
+  const ev = { error: 'overloaded', ts: Date.now() };
+
+  it('enters overload from a StopFailure marker with NO scraper match', async () => {
+    const t = mockTmux('working on a /health endpoint res.status(503)', 'node', true, ev);
+    const s = createMonitorState();
+    const r = await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+    assert.equal(r, 'overload-detected');
+    assert.equal(s.eventMode, true);    // latched
+    assert.equal(s.viaEvent, true);
+    assert.equal(t._cleared, true);     // marker consumed
+    assert.equal(t._sent.length, 0);    // no send yet — backoff first
+    assert.ok(near(s.overloadWaitUntil - Date.now(), 30_000));
+  });
+
+  it('sends exactly once after the window, then returns to monitoring (edge-triggered)', async () => {
+    const t = mockTmux('idle prompt', 'node', true, null);
+    const s = createMonitorState();
+    s.status = 'overload'; s.viaEvent = true; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
+    const r = await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+    assert.equal(r, 'overload-retried');
+    assert.equal(t._sent[0], DEFAULT_OVERLOAD.retryMessage);
+    assert.equal(s.status, 'monitoring');   // back to waiting for the next failure
+    assert.equal(s.viaEvent, false);
+    assert.equal(s.overloadAttempts, 1);
+  });
+
+  it('cancels the send if Claude self-recovered during the backoff', async () => {
+    const t = mockTmux('Thinking… (esc to interrupt)', 'node', true, null);
+    const s = createMonitorState();
+    s.status = 'overload'; s.viaEvent = true; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-cleared');
+    assert.equal(t._sent.length, 0);
+    assert.equal(s.status, 'monitoring');
+  });
+
+  it('treats an event as self-recovered if Claude is already working at detection', async () => {
+    const t = mockTmux('Cogitating… (esc to interrupt)', 'node', true, ev);
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-cleared');
+    assert.equal(t._cleared, true);
+    assert.equal(s.status, 'monitoring');
+    assert.equal(t._sent.length, 0);
+  });
+
+  it('once eventMode is latched, the scraper path is disabled', async () => {
+    const t = mockTmux('API Error: 529 Overloaded', 'node', true, null);  // scraper WOULD match
+    const s = createMonitorState();
+    s.eventMode = true;
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'monitoring');
+    assert.equal(t._sent.length, 0);
+  });
+
+  it('does not send into a shell on an event (foreground gate still applies)', async () => {
+    const t = mockTmux('user@host:~$', 'bash', false, null);
+    const s = createMonitorState();
+    s.status = 'overload'; s.viaEvent = true; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-exited-to-shell');
+    assert.equal(t._sent.length, 0);
+    assert.equal(s.status, 'monitoring');
   });
 });
 

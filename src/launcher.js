@@ -31,9 +31,11 @@ async function launchInteractive(args) {
   const claudeBin = findClaudeBinary();
   const pane = getCurrentPane();
 
+  // CLAUDE_AUTO_RETRY_PANE is inherited by claude's child processes — notably the
+  // StopFailure hook, which writes a pane-keyed event marker the monitor consumes.
   const claude = spawn(claudeBin, args, {
     stdio: 'inherit',
-    env: { ...process.env, CLAUDE_AUTO_RETRY_ACTIVE: '1' },
+    env: { ...process.env, CLAUDE_AUTO_RETRY_ACTIVE: '1', ...(pane ? { CLAUDE_AUTO_RETRY_PANE: pane } : {}) },
   });
 
   // Check spawn succeeded before using PID
